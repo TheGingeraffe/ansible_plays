@@ -1,0 +1,64 @@
+---
+- name: Shuts down all nodes
+  hosts: master
+
+  tasks:
+   - name: Drain and destroy all workers
+     shell: |
+      kubectl drain "{{ item }}" --delete-local-data --force --ignore-daemonsets
+      kubectl delete node "{{ item }}"
+     with_items: "{{ groups['workers'] }}"
+
+   - name: Drain and destroy master node(s)
+     shell: |
+      kubectl drain "{{ item }}" --delete-local-data --force --ignore-daemonsets
+      kubectl delete node "{{ item }}"
+     with_items: "{{ groups['master'] }}"
+
+- name: Resets all kubeadm connections
+  hosts: dev
+  become: yes
+
+  tasks: 
+   - name: Kubeadm reset
+     command: kubeadm reset -f
+  
+- name: Resets iptables rules for cluster
+  hosts: dev
+  become: yes
+  
+  tasks:
+   - name: Flush iptables rules
+     iptables:
+      chain: "{{ item }}"
+      flush: yes
+     with_items:  [ 'INPUT', 'FORWARD', 'OUTPUT' ]
+   - name: Flush iptables nat
+     iptables:
+      table: nat
+      chain: '{{ item }}'
+      flush: yes
+     with_items: [ 'INPUT', 'OUTPUT', 'PREROUTING', 'POSTROUTING' ]
+   - name: Flush iptables mangle
+     iptables:
+      table: mangle
+      chain: '{{ item }}'
+      flush: yes
+     with_items: [ 'INPUT', 'OUTPUT', 'PREROUTING', 'POSTROUTING' ]
+
+- name: Remove config stuff
+  hosts: dev
+  become: yes
+
+  tasks:
+
+   - name: Remove network configs + plugins
+     file:
+      path: "{{ item }}"
+      state: absent
+     with_items:
+      - "/etc/NetworkManager/conf.d"
+      - "/home/{{ ansible_user }}/.kube"
+
+   - name: Remove ${KUBECONFIG}
+     command: sed -i '/KUBECONFIG/d' /etc/environment

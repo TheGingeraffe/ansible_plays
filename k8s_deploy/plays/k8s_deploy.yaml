@@ -1,0 +1,292 @@
+---
+# Playbook for kubernetes cluster pre-checks
+
+- name: Prechecks
+  hosts: dev
+  become: yes
+
+  tasks:
+    - name: Add Kubernetes apt key
+      apt_key:
+        id: 54A647F9048D5688D7DA2ABE6A030B21BA07F4FB
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes repo
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+
+    - name: Install package dependencies
+      apt:
+        pkg:
+          - iptables
+          - arptables
+          - ebtables
+          - iptables-persistent
+          - docker.io
+          - apt-transport-https
+          - ca-certificates
+          - gnupg-agent
+          - software-properties-common
+          - curl
+          - kubeadm
+          - kubelet
+          - kubectl
+        force_apt_get: yes
+        update_cache: yes
+
+    - name: Hold back k8s updates
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      with_items:
+        - kubeadm
+        - kubelet
+        - kubectl
+
+    - name: Update iptables options for kubeadm compatibility
+      alternatives:
+        name: "{{ item }}"
+        link: "/usr/sbin/{{ item }}"
+        path: "/usr/sbin/{{ item }}-legacy"
+      with_items:
+        - iptables
+        - ip6tables
+        - arptables
+        - ebtables
+
+- name: Updating firewall rules for master
+  hosts: master
+  gather_facts: false
+  become: yes
+
+  tasks:
+    - name: Add iptables rules for master node
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+      with_items:
+        - "6443"
+        - "2379:2380"
+        - "10250"
+        - "10251"
+        - "10252"
+      notify:
+        - iptables_dir_check
+        - iptables_save
+
+  handlers:
+    - name: iptables_dir_check
+      file:
+        path: /etc/iptables
+        state: directory
+
+    - name: iptables_save
+      shell: "iptables-save > /etc/iptables/rules.v4"
+
+- name: Updating firewall rules for workers
+  hosts: workers
+  gather_facts: false
+  become: yes
+
+  tasks:
+    - name: Add iptables rules for worker nodes
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+      with_items:
+        - "10250"
+        - "30000:32767"
+      notify:
+        - iptables_dir_check
+        - iptables_save
+
+  handlers:
+    - name: iptables_dir_check
+      file:
+        path: /etc/iptables
+        state: directory
+
+    - name: iptables_save
+      shell: "iptables-save > /etc/iptables/rules.v4"
+
+- name: Docker tasks
+  hosts: dev
+  gather_facts: false
+  become: yes
+
+  tasks:
+    - name: Set default cgroup driver to systemd
+      copy:
+        src: "{{ inventory_dir }}/includes/docker_daemon.json"
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0600"
+      notify:
+        - docker_enable
+        - docker_systemd_dir_check
+
+    - name: Check for swap
+      command: grep -Po '(?<=SwapTotal:\s{13}).+(?= \w+)' /proc/meminfo
+      register: swap_size
+
+    - name: Disable swap
+      command: swapoff --all
+      when: swap_size['stdout'] != "0"
+
+    - name: Check for existence of memory cgroup
+      stat:
+        path: /sys/fs/cgroup/memory
+      register: memory_cgroup_check
+
+    - name: Enable memory cgroup if it doesn't exist
+      lineinfile:
+        path: /boot/firmware/nobtcmd.txt
+        regex: "(^.*$)"
+        line: >
+          net.ifnames=0
+          dwc_otg.lpm_enable=0
+          console=ttyAMA0,115200
+          console=tty1
+          root=LABEL=writable
+          rootfstype=ext4
+          elevator=deadline
+          rootwait
+          cgroup_enable=memory
+          cgroup_memory=1
+      when: memory_cgroup_check.stat.exists == False
+      notify:
+        - Reboot to apply memory cgroup
+
+  handlers:
+    - name: docker_enable
+      command: systemctl enable docker
+
+    - name: docker_systemd_dir_check
+      file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+
+    - name: Reboot to apply memory cgroup
+      reboot:
+
+# Installs Calico network addon on master nodes
+- name: Install pod network addon
+  hosts: master
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - name: Create NetworkManager conf.d dir
+      file:
+        path: /etc/NetworkManager/conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+    - name: Create NetworkManager calico.conf
+      copy:
+        src: "{{ inventory_dir }}/includes/calico.conf"
+        dest: /etc/NetworkManager/conf.d/calico.conf
+        owner: root
+        group: root
+        mode: "0644"
+    - name: Acquire and apply Calico manifest
+      shell: |
+        wget https://docs.projectcalico.org/v3.10/manifests/calico.yaml 
+        POD_CIDR="10.0.0.0/16"
+        sed -i -e "s?192.168.0.0/16?$POD_CIDR?g" calico.yaml
+        kubectl apply -f calico.yaml
+        rm calico.yaml
+        systemctl daemon-reload
+        systemctl restart kubelet
+
+# Initializes master node for master group, worker nodes for worker group
+
+- name: Join cluster
+  hosts: master
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - name: Check if node exists
+      shell: "kubectl get nodes | grep {{ ansible_host }}"
+      register: node_status
+
+    - name: Initialize master node
+      command: kubeadm init --control-plane-endpoint "{{ hostvars[item]['ansible_eth0']['ipv4']['address'] }}"  --pod-network-cidr=10.0.0.0/16
+      when: node_status['stdout'] == ''
+
+    - name: List kubeadm join command
+      command: kubeadm token create --print-join-command
+      register: kubeadm_join
+
+    - name: Set the fact
+      set_fact:
+        kubeadm_join: "{{ kubeadm_join }}"
+
+- name: Join workers to master
+  hosts: workers
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - name: Run kubeadm_join on workers
+      command: "{{ hostvars[item]['kubeadm_join'].stdout }}"
+      with_items: "{{ groups['master'] }}"
+      ignore_errors: yes
+
+- name: Set up kubectl for non-root user
+  hosts: dev
+  become: yes
+  gather_facts: false
+
+  tasks:
+    - name: Make .kube dir for non-root user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+
+    - name: Check for existence of ${KUBECONFIG}
+      shell: "echo $KUBECONFIG"
+      register: k8_var_check
+
+    - name: Copy kubeadm config
+      copy:
+        src: "{{ inventory_dir }}/includes/kube_config"
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+
+    - name: Export config location for current session
+      shell: |
+        "su - {{ ansible_user|quote }} -c export KUBECONFIG=/home/{{ ansible_user|quote }}/.kube/config
+        systemctl daemon-reload
+        systemctl restart kubelet"
+      when: k8_var_check['stdout'] == ''
+      notify: export_kubeconfig
+
+  handlers:
+    - name: export_kubeconfig
+      shell: >
+        echo
+        'KUBECONFIG="/home/{{ ansible_user|quote }}/.kube/config"'
+        >>
+        /etc/environment
+
+- name: Label nodes
+  hosts: master
+  gather_facts: false
+
+  tasks:
+    - name: Apply roles to worker nodes
+      shell: kubectl label node "{{ item }}" node-role.kubernetes.io/worker=
+      with_items: "{{ groups['workers'] }}"
+      when:

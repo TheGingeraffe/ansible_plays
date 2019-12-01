@@ -1,0 +1,18 @@
+---
+- name: TFTP Prechecks
+  hosts: 
+  become: yes
+
+  tasks:
+
+   - name: Package checks
+     yum: 
+       name:
+        - tftp
+        - tftp-server
+        - syslinux
+        - xinetd
+        - wget
+   
+   - name: Firewall checks
+     iptables:

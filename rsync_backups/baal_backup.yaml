@@ -1,0 +1,34 @@
+---
+- name: Prechecks
+  hosts: docker
+  
+  tasks:
+  
+  - name: Create .rsync-filter file
+    copy:
+     src:
+     dest:
+
+- name: Backup baal
+  hosts: hades
+  become: yes
+
+  tasks:
+  
+  - name: Do the transfer
+    synchronize:
+     mode: pull
+     src: "rsync://docker/home/baal"
+     dest: /var/local/backups/
+    delegate_to: hades
+
+# https://docs.ansible.com/ansible/latest/modules/synchronize_module.html
+# https://stackoverflow.com/questions/25505146/how-to-copy-files-between-two-nodes-using-ansible
+# To exclude files and directories from being synchronized, you may add .rsync-filter files to the source directory.
+# rsync -aAvPXHWzh docker:/home/baal --exclude=transmission/downloads --exclude=plex/config /var/local/backups/baal_home_backup
+
+  - name: Prune files
+
+  - name: Make an archive
+
+  - name: Rotate archives
